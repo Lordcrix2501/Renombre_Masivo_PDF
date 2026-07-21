@@ -28,6 +28,19 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# --- NORMALIZADOR DE NOMBRES ---
+def normalizar_nombre(texto):
+    """
+    Limpia espacios al inicio/final, fuerza minúsculas y remueve .pdf 
+    para hacer una comparación limpia e infalible.
+    """
+    if not texto:
+        return ""
+    txt = str(texto).strip().lower()
+    if txt.endswith('.pdf'):
+        txt = txt[:-4].strip()
+    return txt
+
 # --- GENERADOR DE PDF DE NOVEDADES ---
 def generar_pdf_novedades(novedades):
     pdf_buffer = io.BytesIO()
@@ -85,17 +98,15 @@ def generar_pdf_novedades(novedades):
     pdf_buffer.seek(0)
     return pdf_buffer
 
-# --- SIDEBAR / INSTRUCCIONES ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.title("📄 PDF Batch Renamer")
     st.caption("Herramienta Web | Producción")
     st.markdown("---")
     st.markdown("""
-    ### 📌 Guía rápida:
-    1. Prepara tu **Excel** con la lista (Columna A = Nombre actual, Columna B = Nombre nuevo).
-    2. Carga el Excel y selecciona todos los **archivos PDF**.
-    3. Presiona **Procesar y Renombrar**.
-    4. Descarga el archivo **.ZIP** procesado.
+    ### 📌 Modos de Carga:
+    * **Opción A (Arrastrar Carpeta):** Arrastra tu carpeta de PDFs directamente al recuadro.
+    * **Opción B (Archivo ZIP):** Comprime tu carpeta en un archivo `.zip` y súbelo.
     """)
     st.markdown("---")
 
@@ -107,66 +118,87 @@ col1, col2 = st.columns(2, gap="medium")
 
 with col1:
     st.markdown("### 1. Archivo de Mapeo")
-    excel_file = st.file_uploader("Libro de Excel (.xlsx, .xls)", type=["xlsx", "xls"])
+    excel_file = st.file_uploader("Sube el libro de Excel (.xlsx, .xls)", type=["xlsx", "xls"])
 
 with col2:
-    st.markdown("### 2. Documentos PDF")
-    pdf_files = st.file_uploader("Selecciona los archivos PDF", type=["pdf"], accept_multiple_files=True)
+    st.markdown("### 2. Carpeta o Archivos PDF")
+    archivos_subidos = st.file_uploader(
+        "Sube tu archivo .ZIP de la carpeta o arrastra la carpeta de PDFs aquí", 
+        type=["pdf", "zip"], 
+        accept_multiple_files=True
+    )
 
 st.markdown("---")
 
-if excel_file and pdf_files:
+if excel_file and archivos_subidos:
     if st.button("🚀 Procesar y Renombrar PDFs", use_container_width=True):
         try:
             df = pd.read_excel(excel_file, header=None)
             
-            mapeo_nombres = {}
-            mapa_filas = {}
+            mapeo_nombres = {}      # { clave_normalizada: nuevo_nombre_con_pdf }
+            mapa_excel_info = {}   # { clave_normalizada: (num_fila, nombre_original_mostrar, nuevo_nombre_mostrar) }
             
+            # 1. Cargar datos del Excel limpiando espacios
             for index, row in df.iterrows():
                 num_fila = index + 1
                 val_a = str(row[0]).strip() if pd.notna(row[0]) else ''
                 val_b = str(row[1]).strip() if len(row) > 1 and pd.notna(row[1]) else ''
 
                 if val_a and val_a.lower() != 'nan' and val_b and val_b.lower() != 'nan':
-                    orig = val_a if val_a.lower().endswith('.pdf') else val_a + '.pdf'
-                    nuev = val_b if val_b.lower().endswith('.pdf') else val_b + '.pdf'
+                    clave_norm = normalizar_nombre(val_a)
                     
-                    mapeo_nombres[orig.lower()] = nuev
-                    mapa_filas[orig.lower()] = (num_fila, orig, nuev)
+                    nombre_orig_pdf = val_a if val_a.lower().endswith('.pdf') else val_a + '.pdf'
+                    nombre_nuevo_pdf = val_b if val_b.lower().endswith('.pdf') else val_b + '.pdf'
+                    
+                    mapeo_nombres[clave_norm] = nombre_nuevo_pdf
+                    mapa_excel_info[clave_norm] = (num_fila, nombre_orig_pdf, nombre_nuevo_pdf)
+
+            # 2. Extraer archivos ignorando rutas/subcarpetas internas
+            archivos_pdf_dict = {}  # { clave_normalizada: (nombre_real_archivo, contenido_bytes) }
+
+            for item in archivos_subidos:
+                if item.name.lower().endswith('.zip'):
+                    with zipfile.ZipFile(item, 'r') as z:
+                        for filename in z.namelist():
+                            # Filtrar archivos ocultos de Mac o del sistema
+                            if filename.lower().endswith('.pdf') and not filename.startswith('__MACOSX') and not os.path.basename(filename).startswith('.'):
+                                nombre_solo = os.path.basename(filename)
+                                clave_norm = normalizar_nombre(nombre_solo)
+                                archivos_pdf_dict[clave_norm] = (nombre_solo, z.read(filename))
+                elif item.name.lower().endswith('.pdf'):
+                    nombre_solo = os.path.basename(item.name)
+                    clave_norm = normalizar_nombre(nombre_solo)
+                    archivos_pdf_dict[clave_norm] = (nombre_solo, item.read())
 
             zip_buffer = io.BytesIO()
             procesados = 0
             novedades = []
-            archivos_procesados_keys = set()
+            claves_procesadas = set()
 
-            # Creación del paquete ZIP
+            # 3. Cruzar y renombrar
             with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                for pdf in pdf_files:
-                    nombre_orig = pdf.name.strip()
-                    clave = nombre_orig.lower()
-
-                    if clave in mapeo_nombres:
-                        nuevo_nombre = mapeo_nombres[clave]
-                        zip_file.writestr(nuevo_nombre, pdf.read())
+                for clave_norm, (nombre_real, contenido_bytes) in archivos_pdf_dict.items():
+                    if clave_norm in mapeo_nombres:
+                        nuevo_nombre = mapeo_nombres[clave_norm]
+                        zip_file.writestr(nuevo_nombre, contenido_bytes)
                         procesados += 1
-                        archivos_procesados_keys.add(clave)
+                        claves_procesadas.add(clave_norm)
                     else:
                         novedades.append({
                             'fila': '-',
-                            'origen': nombre_orig,
+                            'origen': nombre_real,
                             'destino': '-',
-                            'motivo': 'PDF subido no encontrado en la lista de Excel'
+                            'motivo': 'PDF subido pero no está listado en la Columna A del Excel'
                         })
 
-            # Detectar archivos listados en Excel que no se llegaron a subir
-            for key, (num_fila, orig, nuev) in mapa_filas.items():
-                if key not in archivos_procesados_keys:
+            # 4. Detectar cuáles del Excel faltaron por subir
+            for clave_norm, (num_fila, orig_pdf, nuev_pdf) in mapa_excel_info.items():
+                if clave_norm not in claves_procesadas:
                     novedades.append({
                         'fila': num_fila,
-                        'origen': orig,
-                        'destino': nuev,
-                        'motivo': 'Archivo no cargado en la aplicación'
+                        'origen': orig_pdf,
+                        'destino': nuev_pdf,
+                        'motivo': 'Nombre en Excel no encontrado en la carpeta subida'
                     })
 
             # --- RESULTADOS ---
@@ -175,7 +207,6 @@ if excel_file and pdf_files:
             m_col1.metric("PDFs Procesados Exitosamente", procesados)
             m_col2.metric("Novedades Detectadas", len(novedades))
 
-            # Descarga de ZIP
             if procesados > 0:
                 zip_buffer.seek(0)
                 st.download_button(
@@ -186,7 +217,6 @@ if excel_file and pdf_files:
                     use_container_width=True
                 )
 
-            # Descarga de Reporte PDF si hay novedades
             if novedades:
                 st.warning("⚠️ Se registraron novedades durante el proceso.")
                 pdf_reporte = generar_pdf_novedades(novedades)
@@ -199,7 +229,7 @@ if excel_file and pdf_files:
                     use_container_width=True
                 )
                 
-                with st.expander("Ver tabla de novedades"):
+                with st.expander("Ver tabla detallada de novedades"):
                     st.dataframe(pd.DataFrame(novedades), use_container_width=True)
 
         except Exception as e:
