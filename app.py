@@ -1,5 +1,6 @@
 import os
 import io
+import gc
 import zipfile
 import pandas as pd
 import streamlit as st
@@ -30,10 +31,7 @@ st.markdown("""
 
 # --- NORMALIZADOR DE NOMBRES ---
 def normalizar_nombre(texto):
-    """
-    Limpia espacios al inicio/final, fuerza minúsculas y remueve .pdf 
-    para hacer una comparación limpia e infalible.
-    """
+    """Limpia espacios y formato para evitar falsas novedades en el cruce."""
     if not texto:
         return ""
     txt = str(texto).strip().lower()
@@ -138,7 +136,7 @@ if excel_file and archivos_subidos:
             mapeo_nombres = {}      # { clave_normalizada: nuevo_nombre_con_pdf }
             mapa_excel_info = {}   # { clave_normalizada: (num_fila, nombre_original_mostrar, nuevo_nombre_mostrar) }
             
-            # 1. Cargar datos del Excel limpiando espacios
+            # 1. Leer y mapear Excel
             for index, row in df.iterrows():
                 num_fila = index + 1
                 val_a = str(row[0]).strip() if pd.notna(row[0]) else ''
@@ -153,52 +151,58 @@ if excel_file and archivos_subidos:
                     mapeo_nombres[clave_norm] = nombre_nuevo_pdf
                     mapa_excel_info[clave_norm] = (num_fila, nombre_orig_pdf, nombre_nuevo_pdf)
 
-            # 2. Extraer archivos ignorando rutas/subcarpetas internas
-            archivos_pdf_dict = {}  # { clave_normalizada: (nombre_real_archivo, contenido_bytes) }
-
-            for item in archivos_subidos:
-                if item.name.lower().endswith('.zip'):
-                    with zipfile.ZipFile(item, 'r') as z:
-                        for filename in z.namelist():
-                            # Filtrar archivos ocultos de Mac o del sistema
-                            if filename.lower().endswith('.pdf') and not filename.startswith('__MACOSX') and not os.path.basename(filename).startswith('.'):
-                                nombre_solo = os.path.basename(filename)
-                                clave_norm = normalizar_nombre(nombre_solo)
-                                archivos_pdf_dict[clave_norm] = (nombre_solo, z.read(filename))
-                elif item.name.lower().endswith('.pdf'):
-                    nombre_solo = os.path.basename(item.name)
-                    clave_norm = normalizar_nombre(nombre_solo)
-                    archivos_pdf_dict[clave_norm] = (nombre_solo, item.read())
-
             zip_buffer = io.BytesIO()
             procesados = 0
             novedades = []
             claves_procesadas = set()
 
-            # 3. Cruzar y renombrar
-            with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                for clave_norm, (nombre_real, contenido_bytes) in archivos_pdf_dict.items():
-                    if clave_norm in mapeo_nombres:
-                        nuevo_nombre = mapeo_nombres[clave_norm]
-                        zip_file.writestr(nuevo_nombre, contenido_bytes)
-                        procesados += 1
-                        claves_procesadas.add(clave_norm)
-                    else:
-                        novedades.append({
-                            'fila': '-',
-                            'origen': nombre_real,
-                            'destino': '-',
-                            'motivo': 'PDF subido pero no está listado en la Columna A del Excel'
-                        })
+            # 2. Procesar directamente al ZIP (Sin guardar todo en memoria simultáneamente)
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                for item in archivos_subidos:
+                    if item.name.lower().endswith('.zip'):
+                        with zipfile.ZipFile(item, 'r') as z:
+                            for filename in z.namelist():
+                                if filename.lower().endswith('.pdf') and not filename.startswith('__MACOSX') and not os.path.basename(filename).startswith('.'):
+                                    nombre_solo = os.path.basename(filename)
+                                    clave_norm = normalizar_nombre(nombre_solo)
+                                    
+                                    if clave_norm in mapeo_nombres:
+                                        nuevo_nombre = mapeo_nombres[clave_norm]
+                                        zip_file.writestr(nuevo_nombre, z.read(filename))
+                                        procesados += 1
+                                        claves_procesadas.add(clave_norm)
+                                    else:
+                                        novedades.append({
+                                            'fila': '-',
+                                            'origen': nombre_solo,
+                                            'destino': '-',
+                                            'motivo': 'PDF presente en el ZIP pero no en el Excel'
+                                        })
+                    elif item.name.lower().endswith('.pdf'):
+                        nombre_solo = os.path.basename(item.name)
+                        clave_norm = normalizar_nombre(nombre_solo)
+                        
+                        if clave_norm in mapeo_nombres:
+                            nuevo_nombre = mapeo_nombres[clave_norm]
+                            zip_file.writestr(nuevo_nombre, item.read())
+                            procesados += 1
+                            claves_procesadas.add(clave_norm)
+                        else:
+                            novedades.append({
+                                'fila': '-',
+                                'origen': nombre_solo,
+                                'destino': '-',
+                                'motivo': 'PDF subido pero no está en la Columna A del Excel'
+                            })
 
-            # 4. Detectar cuáles del Excel faltaron por subir
+            # 3. Detectar cuáles faltaron por subir
             for clave_norm, (num_fila, orig_pdf, nuev_pdf) in mapa_excel_info.items():
                 if clave_norm not in claves_procesadas:
                     novedades.append({
                         'fila': num_fila,
                         'origen': orig_pdf,
                         'destino': nuev_pdf,
-                        'motivo': 'Nombre en Excel no encontrado en la carpeta subida'
+                        'motivo': 'Nombre en Excel no encontrado en los archivos subidos'
                     })
 
             # --- RESULTADOS ---
@@ -231,6 +235,9 @@ if excel_file and archivos_subidos:
                 
                 with st.expander("Ver tabla detallada de novedades"):
                     st.dataframe(pd.DataFrame(novedades), use_container_width=True)
+
+            # Liberar memoria de forma explícita
+            gc.collect()
 
         except Exception as e:
             st.error(f"Error crítico al procesar los datos: {e}")
